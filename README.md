@@ -28,6 +28,3 @@ Simple and powerful Roblox universal script with a modern GUI and useful trollin
 ## Notes
 
 Designed for smooth performance and easy use across many games.
-
-```
-```
