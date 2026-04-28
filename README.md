@@ -1,7 +1,8 @@
 ````md id="2jgk5l"
 # FrontEvill Script
+```
 
-```lua
+````lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Front-Evill/Troll/refs/heads/main/main.luau"))()
 ````
 
