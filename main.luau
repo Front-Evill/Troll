@@ -1,25 +1,53 @@
-local Players         = game:GetService("Players")
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║         Alex JOK  –  Script Logger  v7.0                    ║
+-- ║         Fixed & Upgraded for Delta Executor (Mobile)        ║
+-- ║         Multi-hook: loadstring / load / HttpGet /           ║
+-- ║         request / http_request / syn.request / require      ║
+-- ╚══════════════════════════════════════════════════════════════╝
+
+local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local TweenService    = game:GetService("TweenService")
-local StarterGui      = game:GetService("StarterGui")
+local TweenService     = game:GetService("TweenService")
+local StarterGui       = game:GetService("StarterGui")
 
 local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- ── Fluent UI library ────────────────────────────────────────────
 local Fluent           = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
 local SaveManager      = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
 local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
 
+-- ── Core references (saved BEFORE any hooks are installed) ───────
 local originalLoadstring = loadstring
+local originalLoad       = load
 
-local capturedScripts     = {}
-local capturedCount       = 0
-local hookInstalled       = false
+-- ── State ────────────────────────────────────────────────────────
+local capturedScripts = {}
+local capturedCount   = 0
+local seenHashes      = {}      -- deduplication
+local hookInstalled   = false
 local listScrollFrame
 local listLayout
 local counterLabel
 local statusLabel
 local FOLDER = "AlexJOK_Scripts"
+
+-- ── Source-type colours (used by addEntry badges) ────────────────
+local SOURCE_COLORS = {
+    loadstring   = Color3.fromRGB(0,   100, 200),
+    load         = Color3.fromRGB(0,   150, 160),
+    HttpGet      = Color3.fromRGB(200, 110,   0),
+    request      = Color3.fromRGB(130,   0, 180),
+    http_request = Color3.fromRGB(140,  20, 140),
+    ["syn.request"] = Color3.fromRGB(180,   0, 100),
+    require      = Color3.fromRGB( 30, 140,  60),
+    unknown      = Color3.fromRGB( 80,  80,  80),
+}
+
+-- ═══════════════════════════════════════════════════════════════════
+--  UTILITY FUNCTIONS
+-- ═══════════════════════════════════════════════════════════════════
 
 local function notify(title, text)
     pcall(function()
@@ -53,6 +81,133 @@ local function lineCount(code)
     for _ in code:gmatch("\n") do n = n + 1 end
     return n
 end
+
+-- Simple fast hash for deduplication (first 4 KB + total length)
+local function hashCode(s)
+    local h = 5381
+    local cap = math.min(#s, 4096)
+    for i = 1, cap do
+        h = (h * 31 + string.byte(s, i)) % 2147483647
+    end
+    return tostring(h) .. "_" .. tostring(#s)
+end
+
+-- Extract a meaningful filename from a URL
+local function extractNameFromURL(url)
+    if type(url) ~= "string" or url == "" then return nil end
+
+    -- GitHub raw: raw.githubusercontent.com/<user>/<repo>/<ref>/<path>/file.lua
+    local user, file = url:match("raw%.githubusercontent%.com/([^/]+)/[^/]+/[^/]+/.*/([^/?#]+)$")
+    if not file then
+        user, file = url:match("raw%.githubusercontent%.com/([^/]+)/[^/]+/[^/]+/([^/?#]+)$")
+    end
+    if file then
+        local base = file:gsub("%.lua$", ""):gsub("[^%w%-%._]", "_"):sub(1, 30)
+        local u    = user:sub(1, 12):gsub("[^%w%-%._]", "_")
+        return (u .. "_" .. base):sub(1, 40)
+    end
+
+    -- General: grab the last path segment
+    local seg = url:match("/([^/?#]+)%.[Ll][Uu][Aa]") or url:match("/([^/?#]+)$")
+    if seg and #seg > 0 then
+        return seg:gsub("%.lua$", ""):gsub("[^%w%-%._]", "_"):sub(1, 40)
+    end
+
+    -- Fallback: domain slug
+    local domain = url:match("https?://([^/]+)")
+    if domain then
+        return domain:gsub("[^%w%-]", "_"):sub(1, 28) .. "_dl"
+    end
+
+    return nil
+end
+
+-- Heuristic: does this string look like Lua source?
+local function isProbablyScript(s)
+    if type(s) ~= "string" or #s < 12 then return false end
+    local head = s:sub(1, 6)
+    -- Reject common binary / data formats
+    if head:sub(1, 4) == "\27Lua"       then return true  end -- pre-compiled Lua bytecode
+    if head:sub(1, 4) == "\137PNG"      then return false end
+    if head:sub(1, 3) == "GIF"          then return false end
+    if head:sub(1, 2) == "\255\216"     then return false end -- JPEG
+    if head:sub(1, 4) == "RIFF"         then return false end
+    if head:sub(1, 1) == "{"            then return false end -- JSON object
+    if head:sub(1, 1) == "["            then return false end -- JSON array
+    if head:sub(1, 5) == "<?xml"        then return false end
+    if head:sub(1, 6) == "<html>"       then return false end
+    -- Lua keyword presence is a strong signal
+    local probe = s:sub(1, 512)
+    if probe:match("local%s+")   then return true end
+    if probe:match("function%s") then return true end
+    if probe:match("%-%-")        then return true end
+    if probe:match("game[%.:%(]") then return true end
+    if probe:match("workspace")   then return true end
+    if probe:match("require%(")   then return true end
+    if probe:match("print%(")     then return true end
+    if probe:match("end%s")       then return true end
+    -- Worst case: accept it anyway (let the user decide)
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+--  UNIFIED CAPTURE FUNCTION
+--  All hooks funnel through here.
+-- ═══════════════════════════════════════════════════════════════════
+
+local function captureScript(code, source, hint)
+    -- Basic type + length guard
+    if type(code) ~= "string" or #code < 10 then return end
+
+    -- Deduplication via hash
+    local h = hashCode(code)
+    if seenHashes[h] then return end
+    seenHashes[h] = true
+
+    -- Build a meaningful file name
+    local baseName
+    if hint and hint:match("^https?://") then
+        baseName = extractNameFromURL(hint) or (source or "script")
+    elseif hint and type(hint) == "string" and #hint > 0 then
+        baseName = hint:gsub("[^%w%-%._]", "_"):sub(1, 38)
+        if baseName == "" or baseName == "_" then baseName = source or "script" end
+    else
+        baseName = source or "script"
+    end
+
+    capturedCount = capturedCount + 1
+    local fileName = baseName .. "_" .. capturedCount .. ".lua"
+
+    local data = {
+        index    = capturedCount,
+        code     = code,
+        fileName = fileName,
+        source   = source or "unknown",
+        hint     = hint or "",
+        time     = os.date("%H:%M:%S"),
+    }
+
+    table.insert(capturedScripts, data)
+    ensureFolder()
+    writeFile(FOLDER .. "/" .. fileName, code)
+
+    -- UI updates run on the main scheduler so they never block hooks
+    task.spawn(function()
+        if counterLabel then
+            counterLabel.Text = "Captured: " .. capturedCount
+        end
+        if statusLabel then
+            statusLabel.Text       = "Script Logger  –  Active"
+            statusLabel.TextColor3 = Color3.fromRGB(86, 182, 86)
+        end
+        addEntry(data)
+        notify("Alex JOK", string.format("#%d  [%s]  %s", capturedCount, source or "?", fileName))
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+--  SCRIPT EDITOR  (unchanged from original, kept fully intact)
+-- ═══════════════════════════════════════════════════════════════════
 
 local function openEditor(scriptData)
     local existing = playerGui:FindFirstChild("_ScriptEditorGui")
@@ -96,10 +251,10 @@ local function openEditor(scriptData)
     winCorner.Parent       = win
 
     local winStroke = Instance.new("UIStroke")
-    winStroke.Color       = Color3.fromRGB(0, 122, 204)
-    winStroke.Thickness   = 1.2
+    winStroke.Color        = Color3.fromRGB(0, 122, 204)
+    winStroke.Thickness    = 1.2
     winStroke.Transparency = 0.55
-    winStroke.Parent      = win
+    winStroke.Parent       = win
 
     local TITLE_H = 32
 
@@ -123,29 +278,29 @@ local function openEditor(scriptData)
     tbBottomFix.Parent           = titleBar
 
     local titleText = Instance.new("TextLabel")
-    titleText.Size                = UDim2.new(1, -110, 1, 0)
-    titleText.Position            = UDim2.new(0, 12, 0, 0)
+    titleText.Size                   = UDim2.new(1, -110, 1, 0)
+    titleText.Position               = UDim2.new(0, 12, 0, 0)
     titleText.BackgroundTransparency = 1
-    titleText.Text                = fileName
-    titleText.TextColor3          = Color3.fromRGB(200, 200, 200)
-    titleText.TextSize            = 11
-    titleText.Font                = Enum.Font.Code
-    titleText.TextXAlignment      = Enum.TextXAlignment.Left
-    titleText.TextTruncate        = Enum.TextTruncate.AtEnd
-    titleText.ZIndex              = 4
-    titleText.Parent              = titleBar
+    titleText.Text                   = fileName
+    titleText.TextColor3             = Color3.fromRGB(200, 200, 200)
+    titleText.TextSize               = 11
+    titleText.Font                   = Enum.Font.Code
+    titleText.TextXAlignment         = Enum.TextXAlignment.Left
+    titleText.TextTruncate           = Enum.TextTruncate.AtEnd
+    titleText.ZIndex                 = 4
+    titleText.Parent                 = titleBar
 
     local closeX = Instance.new("TextButton")
-    closeX.Size                   = UDim2.new(0, 16, 0, 16)
-    closeX.Position               = UDim2.new(1, -24, 0.5, -8)
-    closeX.BackgroundColor3       = Color3.fromRGB(196, 43, 28)
-    closeX.BorderSizePixel        = 0
-    closeX.Text                   = "x"
-    closeX.TextColor3             = Color3.fromRGB(255, 255, 255)
-    closeX.TextSize               = 9
-    closeX.Font                   = Enum.Font.GothamBold
-    closeX.ZIndex                 = 5
-    closeX.Parent                 = titleBar
+    closeX.Size             = UDim2.new(0, 16, 0, 16)
+    closeX.Position         = UDim2.new(1, -24, 0.5, -8)
+    closeX.BackgroundColor3 = Color3.fromRGB(196, 43, 28)
+    closeX.BorderSizePixel  = 0
+    closeX.Text             = "x"
+    closeX.TextColor3       = Color3.fromRGB(255, 255, 255)
+    closeX.TextSize         = 9
+    closeX.Font             = Enum.Font.GothamBold
+    closeX.ZIndex           = 5
+    closeX.Parent           = titleBar
 
     local closeXCorner = Instance.new("UICorner")
     closeXCorner.CornerRadius = UDim.new(1, 0)
@@ -154,9 +309,9 @@ local function openEditor(scriptData)
     closeX.MouseButton1Click:Connect(function() editorGui:Destroy() end)
     backdrop.MouseButton1Click:Connect(function() editorGui:Destroy() end)
 
-    local dragging   = false
-    local dragStart  = nil
-    local winStart   = nil
+    local dragging  = false
+    local dragStart = nil
+    local winStart  = nil
 
     titleBar.InputBegan:Connect(function(inp)
         if inp.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -207,17 +362,17 @@ local function openEditor(scriptData)
     tabAccent.Parent           = activeTab
 
     local tabText = Instance.new("TextLabel")
-    tabText.Size                = UDim2.new(1, -12, 1, 0)
-    tabText.Position            = UDim2.new(0, 8, 0, 0)
+    tabText.Size                   = UDim2.new(1, -12, 1, 0)
+    tabText.Position               = UDim2.new(0, 8, 0, 0)
     tabText.BackgroundTransparency = 1
-    tabText.Text                = fileName
-    tabText.TextColor3          = Color3.fromRGB(220, 220, 220)
-    tabText.TextSize            = 10
-    tabText.Font                = Enum.Font.Code
-    tabText.TextXAlignment      = Enum.TextXAlignment.Left
-    tabText.TextTruncate        = Enum.TextTruncate.AtEnd
-    tabText.ZIndex              = 5
-    tabText.Parent              = activeTab
+    tabText.Text                   = fileName
+    tabText.TextColor3             = Color3.fromRGB(220, 220, 220)
+    tabText.TextSize               = 10
+    tabText.Font                   = Enum.Font.Code
+    tabText.TextXAlignment         = Enum.TextXAlignment.Left
+    tabText.TextTruncate           = Enum.TextTruncate.AtEnd
+    tabText.ZIndex                 = 5
+    tabText.Parent                 = activeTab
 
     local TOOLBAR_H = 38
     local STATUS_H  = 22
@@ -260,17 +415,17 @@ local function openEditor(scriptData)
     gutterLayout.Parent    = gutterScroll
 
     local codeScroll = Instance.new("ScrollingFrame")
-    codeScroll.Size                      = UDim2.new(1, -GUTTER_W, 1, 0)
-    codeScroll.Position                  = UDim2.new(0, GUTTER_W, 0, 0)
-    codeScroll.BackgroundColor3          = Color3.fromRGB(30, 30, 30)
-    codeScroll.BorderSizePixel           = 0
-    codeScroll.ScrollBarThickness        = 6
-    codeScroll.ScrollBarImageColor3      = Color3.fromRGB(80, 80, 80)
+    codeScroll.Size                       = UDim2.new(1, -GUTTER_W, 1, 0)
+    codeScroll.Position                   = UDim2.new(0, GUTTER_W, 0, 0)
+    codeScroll.BackgroundColor3           = Color3.fromRGB(30, 30, 30)
+    codeScroll.BorderSizePixel            = 0
+    codeScroll.ScrollBarThickness         = 6
+    codeScroll.ScrollBarImageColor3       = Color3.fromRGB(80, 80, 80)
     codeScroll.ScrollBarImageTransparency = 0.2
-    codeScroll.CanvasSize                = UDim2.fromScale(0, 0)
-    codeScroll.AutomaticCanvasSize       = Enum.AutomaticSize.Y
-    codeScroll.ZIndex                    = 4
-    codeScroll.Parent                    = editorFrame
+    codeScroll.CanvasSize                 = UDim2.fromScale(0, 0)
+    codeScroll.AutomaticCanvasSize        = Enum.AutomaticSize.Y
+    codeScroll.ZIndex                     = 4
+    codeScroll.Parent                     = editorFrame
 
     codeScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
         gutterScroll.CanvasPosition = Vector2.new(0, codeScroll.CanvasPosition.Y)
@@ -304,16 +459,16 @@ local function openEditor(scriptData)
         local n = math.min(lineCount(code), 5000)
         for i = 1, n do
             local ln = Instance.new("TextLabel")
-            ln.Size                = UDim2.new(1, -6, 0, LINE_H)
+            ln.Size                   = UDim2.new(1, -6, 0, LINE_H)
             ln.BackgroundTransparency = 1
-            ln.Text                = tostring(i)
-            ln.TextColor3          = Color3.fromRGB(90, 90, 90)
-            ln.TextSize            = 13
-            ln.Font                = Enum.Font.Code
-            ln.TextXAlignment      = Enum.TextXAlignment.Right
-            ln.LayoutOrder         = i
-            ln.ZIndex              = 4
-            ln.Parent              = gutterScroll
+            ln.Text                   = tostring(i)
+            ln.TextColor3             = Color3.fromRGB(90, 90, 90)
+            ln.TextSize               = 13
+            ln.Font                   = Enum.Font.Code
+            ln.TextXAlignment         = Enum.TextXAlignment.Right
+            ln.LayoutOrder            = i
+            ln.ZIndex                 = 4
+            ln.Parent                 = gutterScroll
         end
     end
 
@@ -373,12 +528,12 @@ local function openEditor(scriptData)
         return btn
     end
 
-    local G = 8
-    local copyBtn   = makeBtn("Copy",    G,         80,  Color3.fromRGB(0,   95, 165))
-    local saveBtn   = makeBtn("Save",    G+88,      80,  Color3.fromRGB(0,  125,  55))
-    local saveAsBtn = makeBtn("Save As", G+176,     90,  Color3.fromRGB(80,  60,   0))
-    local execBtn   = makeBtn("Execute", G+274,     90,  Color3.fromRGB(105,  0, 175))
-    local closeBtn  = makeBtn("Close",   WIN_W-G-80, 80, Color3.fromRGB(155, 28,  28))
+    local G         = 8
+    local copyBtn   = makeBtn("Copy",    G,              80,  Color3.fromRGB(0,   95, 165))
+    local saveBtn   = makeBtn("Save",    G + 88,         80,  Color3.fromRGB(0,  125,  55))
+    local saveAsBtn = makeBtn("Save As", G + 176,        90,  Color3.fromRGB(80,  60,   0))
+    local execBtn   = makeBtn("Execute", G + 274,        90,  Color3.fromRGB(105,  0, 175))
+    local closeBtn  = makeBtn("Close",   WIN_W - G - 80, 80,  Color3.fromRGB(155, 28,  28))
 
     local statusBar = Instance.new("Frame")
     statusBar.Size             = UDim2.new(1, 0, 0, STATUS_H)
@@ -400,19 +555,19 @@ local function openEditor(scriptData)
     sbTopFix.Parent           = statusBar
 
     local sbText = Instance.new("TextLabel")
-    sbText.Size                = UDim2.new(1, -10, 1, 0)
-    sbText.Position            = UDim2.new(0, 8, 0, 0)
+    sbText.Size                   = UDim2.new(1, -10, 1, 0)
+    sbText.Position               = UDim2.new(0, 8, 0, 0)
     sbText.BackgroundTransparency = 1
-    sbText.TextColor3          = Color3.fromRGB(255, 255, 255)
-    sbText.TextSize            = 10
-    sbText.Font                = Enum.Font.Code
-    sbText.TextXAlignment      = Enum.TextXAlignment.Left
-    sbText.ZIndex              = 4
-    sbText.Parent              = statusBar
+    sbText.TextColor3             = Color3.fromRGB(255, 255, 255)
+    sbText.TextSize               = 10
+    sbText.Font                   = Enum.Font.Code
+    sbText.TextXAlignment         = Enum.TextXAlignment.Left
+    sbText.ZIndex                 = 4
+    sbText.Parent                 = statusBar
 
     local function refreshStatus()
-        local ln  = lineCount(liveCode)
-        local ch  = #liveCode
+        local ln = lineCount(liveCode)
+        local ch = #liveCode
         sbText.Text = "Lua   Lines: " .. ln .. "   Chars: " .. ch .. "   " .. fileName
     end
 
@@ -475,15 +630,21 @@ local function openEditor(scriptData)
     }):Play()
 end
 
-local function addEntry(data)
+-- ═══════════════════════════════════════════════════════════════════
+--  ENTRY CARD  (upgraded: now shows source-type badge)
+-- ═══════════════════════════════════════════════════════════════════
+
+function addEntry(data)
     if not listScrollFrame then return end
 
-    local idx   = data.index
-    local code  = data.code
-    local fname = data.fileName
-    local ts    = data.time
-    local lines = lineCount(code)
+    local idx    = data.index
+    local code   = data.code
+    local fname  = data.fileName
+    local ts     = data.time
+    local src    = data.source or "unknown"
+    local lines  = lineCount(code)
 
+    -- First non-empty line as preview
     local preview = "(empty)"
     for line in code:gmatch("[^\n]+") do
         local t = line:match("^%s*(.-)%s*$")
@@ -494,8 +655,10 @@ local function addEntry(data)
     end
     if #preview > 62 then preview = preview:sub(1, 62) .. "..." end
 
+    local srcColor = SOURCE_COLORS[src] or SOURCE_COLORS["unknown"]
+
     local entry = Instance.new("Frame")
-    entry.Size                   = UDim2.new(1, -4, 0, 112)
+    entry.Size                   = UDim2.new(1, -4, 0, 118)
     entry.BackgroundColor3       = Color3.fromRGB(28, 30, 40)
     entry.BackgroundTransparency = 1
     entry.BorderSizePixel        = 0
@@ -506,9 +669,10 @@ local function addEntry(data)
     eCorner.CornerRadius = UDim.new(0, 8)
     eCorner.Parent       = entry
 
+    -- Left accent bar (colour = source type)
     local accent = Instance.new("Frame")
     accent.Size             = UDim2.new(0, 3, 1, 0)
-    accent.BackgroundColor3 = Color3.fromRGB(0, 122, 204)
+    accent.BackgroundColor3 = srcColor
     accent.BorderSizePixel  = 0
     accent.Parent           = entry
 
@@ -516,80 +680,104 @@ local function addEntry(data)
     accentCorner.CornerRadius = UDim.new(0, 3)
     accentCorner.Parent       = accent
 
+    -- Index badge
     local badge = Instance.new("TextLabel")
-    badge.Size                  = UDim2.new(0, 34, 0, 18)
-    badge.Position              = UDim2.new(0, 10, 0, 6)
-    badge.BackgroundColor3      = Color3.fromRGB(0, 80, 160)
+    badge.Size                   = UDim2.new(0, 34, 0, 18)
+    badge.Position               = UDim2.new(0, 10, 0, 6)
+    badge.BackgroundColor3       = Color3.fromRGB(0, 80, 160)
     badge.BackgroundTransparency = 0
-    badge.BorderSizePixel       = 0
-    badge.Text                  = "#" .. idx
-    badge.TextColor3            = Color3.fromRGB(255, 255, 255)
-    badge.TextSize              = 9
-    badge.Font                  = Enum.Font.GothamBold
-    badge.Parent                = entry
+    badge.BorderSizePixel        = 0
+    badge.Text                   = "#" .. idx
+    badge.TextColor3             = Color3.fromRGB(255, 255, 255)
+    badge.TextSize               = 9
+    badge.Font                   = Enum.Font.GothamBold
+    badge.Parent                 = entry
 
     local badgeCorner = Instance.new("UICorner")
     badgeCorner.CornerRadius = UDim.new(0, 4)
     badgeCorner.Parent       = badge
 
+    -- Timestamp
     local timeLbl = Instance.new("TextLabel")
-    timeLbl.Size                 = UDim2.new(0, 65, 0, 18)
-    timeLbl.Position             = UDim2.new(0, 48, 0, 6)
+    timeLbl.Size                   = UDim2.new(0, 60, 0, 18)
+    timeLbl.Position               = UDim2.new(0, 48, 0, 6)
     timeLbl.BackgroundTransparency = 1
-    timeLbl.Text                 = ts
-    timeLbl.TextColor3           = Color3.fromRGB(86, 182, 86)
-    timeLbl.TextSize             = 9
-    timeLbl.Font                 = Enum.Font.Code
-    timeLbl.TextXAlignment       = Enum.TextXAlignment.Left
-    timeLbl.Parent               = entry
+    timeLbl.Text                   = ts
+    timeLbl.TextColor3             = Color3.fromRGB(86, 182, 86)
+    timeLbl.TextSize               = 9
+    timeLbl.Font                   = Enum.Font.Code
+    timeLbl.TextXAlignment         = Enum.TextXAlignment.Left
+    timeLbl.Parent                 = entry
 
+    -- Lines / chars
     local linesLbl = Instance.new("TextLabel")
-    linesLbl.Size                = UDim2.new(0, 100, 0, 18)
-    linesLbl.Position            = UDim2.new(0, 116, 0, 6)
+    linesLbl.Size                   = UDim2.new(0, 100, 0, 18)
+    linesLbl.Position               = UDim2.new(0, 112, 0, 6)
     linesLbl.BackgroundTransparency = 1
-    linesLbl.Text                = lines .. " lines  |  " .. #code .. " chars"
-    linesLbl.TextColor3          = Color3.fromRGB(140, 140, 170)
-    linesLbl.TextSize            = 9
-    linesLbl.Font                = Enum.Font.Code
-    linesLbl.TextXAlignment      = Enum.TextXAlignment.Left
-    linesLbl.Parent              = entry
+    linesLbl.Text                   = lines .. " ln  |  " .. #code .. " ch"
+    linesLbl.TextColor3             = Color3.fromRGB(140, 140, 170)
+    linesLbl.TextSize               = 9
+    linesLbl.Font                   = Enum.Font.Code
+    linesLbl.TextXAlignment         = Enum.TextXAlignment.Left
+    linesLbl.Parent                 = entry
 
+    -- Source-type badge  ← NEW
+    local srcBadge = Instance.new("TextLabel")
+    srcBadge.Size                   = UDim2.new(0, 80, 0, 16)
+    srcBadge.Position               = UDim2.new(1, -90, 0, 8)
+    srcBadge.BackgroundColor3       = srcColor
+    srcBadge.BackgroundTransparency = 0.25
+    srcBadge.BorderSizePixel        = 0
+    srcBadge.Text                   = src
+    srcBadge.TextColor3             = Color3.fromRGB(255, 255, 255)
+    srcBadge.TextSize               = 8
+    srcBadge.Font                   = Enum.Font.GothamBold
+    srcBadge.TextXAlignment         = Enum.TextXAlignment.Center
+    srcBadge.Parent                 = entry
+
+    local srcCorner = Instance.new("UICorner")
+    srcCorner.CornerRadius = UDim.new(0, 4)
+    srcCorner.Parent       = srcBadge
+
+    -- File name
     local fileLbl = Instance.new("TextLabel")
-    fileLbl.Size                = UDim2.new(1, -16, 0, 14)
-    fileLbl.Position            = UDim2.new(0, 10, 0, 27)
+    fileLbl.Size                   = UDim2.new(1, -16, 0, 14)
+    fileLbl.Position               = UDim2.new(0, 10, 0, 27)
     fileLbl.BackgroundTransparency = 1
-    fileLbl.Text                = fname
-    fileLbl.TextColor3          = Color3.fromRGB(220, 170, 75)
-    fileLbl.TextSize            = 9
-    fileLbl.Font                = Enum.Font.GothamBold
-    fileLbl.TextXAlignment      = Enum.TextXAlignment.Left
-    fileLbl.TextTruncate        = Enum.TextTruncate.AtEnd
-    fileLbl.Parent              = entry
+    fileLbl.Text                   = fname
+    fileLbl.TextColor3             = Color3.fromRGB(220, 170, 75)
+    fileLbl.TextSize               = 9
+    fileLbl.Font                   = Enum.Font.GothamBold
+    fileLbl.TextXAlignment         = Enum.TextXAlignment.Left
+    fileLbl.TextTruncate           = Enum.TextTruncate.AtEnd
+    fileLbl.Parent                 = entry
 
+    -- Code preview bar
     local previewBar = Instance.new("Frame")
-    previewBar.Size             = UDim2.new(1, -16, 0, 22)
-    previewBar.Position         = UDim2.new(0, 10, 0, 44)
-    previewBar.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    previewBar.Size                   = UDim2.new(1, -16, 0, 22)
+    previewBar.Position               = UDim2.new(0, 10, 0, 44)
+    previewBar.BackgroundColor3       = Color3.fromRGB(18, 18, 24)
     previewBar.BackgroundTransparency = 0
-    previewBar.BorderSizePixel  = 0
-    previewBar.Parent           = entry
+    previewBar.BorderSizePixel        = 0
+    previewBar.Parent                 = entry
 
     local pbCorner = Instance.new("UICorner")
     pbCorner.CornerRadius = UDim.new(0, 4)
     pbCorner.Parent       = previewBar
 
     local previewLbl = Instance.new("TextLabel")
-    previewLbl.Size                = UDim2.new(1, -10, 1, 0)
-    previewLbl.Position            = UDim2.new(0, 6, 0, 0)
+    previewLbl.Size                   = UDim2.new(1, -10, 1, 0)
+    previewLbl.Position               = UDim2.new(0, 6, 0, 0)
     previewLbl.BackgroundTransparency = 1
-    previewLbl.Text                = preview
-    previewLbl.TextColor3          = Color3.fromRGB(144, 212, 144)
-    previewLbl.TextSize            = 10
-    previewLbl.Font                = Enum.Font.Code
-    previewLbl.TextXAlignment      = Enum.TextXAlignment.Left
-    previewLbl.TextTruncate        = Enum.TextTruncate.AtEnd
-    previewLbl.Parent              = previewBar
+    previewLbl.Text                   = preview
+    previewLbl.TextColor3             = Color3.fromRGB(144, 212, 144)
+    previewLbl.TextSize               = 10
+    previewLbl.Font                   = Enum.Font.Code
+    previewLbl.TextXAlignment         = Enum.TextXAlignment.Left
+    previewLbl.TextTruncate           = Enum.TextTruncate.AtEnd
+    previewLbl.Parent                 = previewBar
 
+    -- Action buttons
     local BW   = 82
     local BH   = 20
     local BGAP = 5
@@ -597,7 +785,7 @@ local function addEntry(data)
     local function mkBtn(label, xi, bg)
         local btn = Instance.new("TextButton")
         btn.Size                   = UDim2.new(0, BW, 0, BH)
-        btn.Position               = UDim2.new(0, 10 + xi * (BW + BGAP), 0, 70)
+        btn.Position               = UDim2.new(0, 10 + xi * (BW + BGAP), 0, 72)
         btn.BackgroundColor3       = bg
         btn.BackgroundTransparency = 0.05
         btn.BorderSizePixel        = 0
@@ -618,10 +806,10 @@ local function addEntry(data)
         return btn
     end
 
-    local editBtn   = mkBtn("Edit / View", 0, Color3.fromRGB(0,  88, 160))
-    local copyBtn   = mkBtn("Copy Code",   1, Color3.fromRGB(0, 118,  52))
-    local execBtn2  = mkBtn("Execute",     2, Color3.fromRGB(98,  0, 172))
-    local deleteBtn = mkBtn("Delete",      3, Color3.fromRGB(155, 26,  26))
+    local editBtn   = mkBtn("Edit / View", 0, Color3.fromRGB(0,   88, 160))
+    local copyBtn   = mkBtn("Copy Code",   1, Color3.fromRGB(0,  118,  52))
+    local execBtn2  = mkBtn("Execute",     2, Color3.fromRGB(98,   0, 172))
+    local deleteBtn = mkBtn("Delete",      3, Color3.fromRGB(155,  26,  26))
 
     local function flash(btn, orig)
         btn.Text = "Done"
@@ -681,28 +869,229 @@ local function addEntry(data)
         {BackgroundTransparency = 0}):Play()
 end
 
-local Window = Fluent:CreateWindow({
-    Title      = "Alex JOK",
-    SubTitle   = "FRontEVill was here | v1.2",
-    TabWidth   = 160,
-    Size       = UDim2.fromOffset(660, 560),
-    Acrylic    = true,
-    Theme      = "Dark",
-    MinimizeKey = Enum.KeyCode.B,
-})
+-- ═══════════════════════════════════════════════════════════════════
+--  MULTI-HOOK INSTALLER
+--  Covers: loadstring, load, game:HttpGet, request, http_request,
+--          syn.request, fluxus/celery aliases, require (log only)
+-- ═══════════════════════════════════════════════════════════════════
 
-local Tabs = {
-    Logger   = Window:AddTab({ Title = "Script Logger", Icon = "code-2"   }),
-    Settings = Window:AddTab({ Title = "Settings",      Icon = "settings" }),
-}
+local function installHooks()
+    -- Executor environment globals
+    local genv = (getgenv and getgenv()) or _G
+
+    -- Detect executor hook capabilities
+    local canHookFunc = type(hookfunction) == "function"
+    local canNewCC    = type(newcclosure)  == "function"
+
+    -- Wrap a replacement in a newcclosure if possible (helps bypass read-only checks)
+    local function wrap(fn)
+        if canNewCC then
+            return newcclosure(fn)
+        end
+        return fn
+    end
+
+    -- Try hookfunction first, fall back to global override
+    local function applyHook(orig, replacement, globalKey)
+        local wrapped = wrap(replacement)
+        if canHookFunc and orig then
+            local ok = pcall(hookfunction, orig, wrapped)
+            if ok then return true end
+        end
+        -- Global override fallback
+        if globalKey then
+            local ok2 = pcall(function() genv[globalKey] = wrapped end)
+            return ok2
+        end
+        return false
+    end
+
+    local hookResults = {}
+
+    -- ── 1. loadstring ──────────────────────────────────────────────
+    do
+        local orig = genv.loadstring or loadstring
+        originalLoadstring = orig   -- keep our reference current
+        local replacement = function(code, chunkname)
+            pcall(captureScript, code, "loadstring", chunkname)
+            return orig(code, chunkname)
+        end
+        local ok = applyHook(orig, replacement, "loadstring")
+        hookResults.loadstring = ok
+    end
+
+    -- ── 2. load  (may differ from loadstring on some executors) ────
+    do
+        local orig = genv.load
+        if orig and orig ~= genv.loadstring then
+            originalLoad = orig
+            local replacement = function(code, chunkname, ...)
+                if type(code) == "string" then
+                    pcall(captureScript, code, "load", chunkname)
+                end
+                return orig(code, chunkname, ...)
+            end
+            local ok = applyHook(orig, replacement, "load")
+            hookResults.load = ok
+        end
+    end
+
+    -- ── 3. game:HttpGet ────────────────────────────────────────────
+    --  We hook AFTER the download so we get the actual Lua source.
+    do
+        local origHG = game.HttpGet
+        if origHG then
+            local replacement = function(self, url, async)
+                local result = origHG(self, url, async)
+                if type(result) == "string" and isProbablyScript(result) then
+                    pcall(captureScript, result, "HttpGet", url)
+                end
+                return result
+            end
+            local ok = pcall(function()
+                if canHookFunc then
+                    hookfunction(origHG, wrap(replacement))
+                end
+            end)
+            -- Also patch via rawset on the instance as a fallback
+            if not ok then
+                pcall(function()
+                    local mt = getrawmetatable and getrawmetatable(game)
+                    if mt then
+                        local oldIndex = mt.__index
+                        setreadonly(mt, false)
+                        mt.__index = wrap(function(self2, key)
+                            if key == "HttpGet" then
+                                return replacement
+                            end
+                            return oldIndex(self2, key)
+                        end)
+                        setreadonly(mt, true)
+                    end
+                end)
+            end
+            hookResults.HttpGet = ok
+        end
+    end
+
+    -- ── 4. request  (Delta native + common aliases) ────────────────
+    local requestAliases = { "request", "http_request", "https_request" }
+    for _, name in ipairs(requestAliases) do
+        local orig = genv[name]
+        if type(orig) == "function" then
+            local capName = name  -- closure copy
+            local replacement = function(opts)
+                local result = orig(opts)
+                if type(result) == "table" then
+                    local body = result.Body or result.body
+                    if type(body) == "string" and isProbablyScript(body) then
+                        local url = (type(opts) == "table" and (opts.Url or opts.url)) or capName
+                        pcall(captureScript, body, capName, url)
+                    end
+                end
+                return result
+            end
+            local ok = applyHook(orig, replacement, name)
+            hookResults[name] = ok
+        end
+    end
+
+    -- ── 5. syn.request  (Synapse / Delta compatibility layer) ──────
+    pcall(function()
+        if syn and type(syn.request) == "function" and canHookFunc and canNewCC then
+            local orig = syn.request
+            local replacement = newcclosure(function(opts)
+                local result = orig(opts)
+                if type(result) == "table" then
+                    local body = result.Body or result.body
+                    if type(body) == "string" and isProbablyScript(body) then
+                        local url = (type(opts) == "table" and (opts.Url or opts.url)) or "syn.request"
+                        pcall(captureScript, body, "syn.request", url)
+                    end
+                end
+                return result
+            end)
+            hookfunction(orig, replacement)
+            hookResults["syn.request"] = true
+        end
+    end)
+
+    -- ── 6. require  (log module usage; source code not accessible) ─
+    pcall(function()
+        local orig = genv.require
+        if type(orig) == "function" then
+            local replacement = function(module)
+                -- We can't extract Lua source from a ModuleScript,
+                -- but we can log that it was required and optionally
+                -- capture any string passed (rare pattern some loaders use).
+                if type(module) == "string" and isProbablyScript(module) then
+                    pcall(captureScript, module, "require", nil)
+                end
+                return orig(module)
+            end
+            -- Avoid hooking if it would break the game's require chain
+            -- Only apply global override (hookfunction on require is risky)
+            pcall(function() genv.require = wrap(replacement) end)
+            hookResults.require = true
+        end
+    end)
+
+    -- ── 7. fluxus / celery executor aliases ────────────────────────
+    pcall(function()
+        local extras = { "fluxus", "celery" }
+        for _, ns in ipairs(extras) do
+            local env = genv[ns]
+            if type(env) == "table" and type(env.request) == "function" and canHookFunc and canNewCC then
+                local orig = env.request
+                local nsName = ns .. ".request"
+                local replacement = newcclosure(function(opts)
+                    local result = orig(opts)
+                    if type(result) == "table" then
+                        local body = result.Body or result.body
+                        if type(body) == "string" and isProbablyScript(body) then
+                            local url = (type(opts) == "table" and (opts.Url or opts.url)) or nsName
+                            pcall(captureScript, body, nsName, url)
+                        end
+                    end
+                    return result
+                end)
+                pcall(hookfunction, orig, replacement)
+            end
+        end
+    end)
+
+    -- ── Report ─────────────────────────────────────────────────────
+    hookInstalled = hookResults.loadstring == true
+
+    local activeMethods = {}
+    for method, ok in pairs(hookResults) do
+        if ok then table.insert(activeMethods, method) end
+    end
+    table.sort(activeMethods)
+
+    task.delay(1, function()
+        if hookInstalled then
+            notify("Alex JOK",
+                "Hooks active: " .. table.concat(activeMethods, ", "))
+        else
+            notify("Alex JOK",
+                "loadstring hook blocked. Partial hooks: " ..
+                table.concat(activeMethods, ", "))
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+--  LOGGER UI  (unchanged)
+-- ═══════════════════════════════════════════════════════════════════
 
 local function buildLoggerUI(container)
     local topBar = Instance.new("Frame")
-    topBar.Size             = UDim2.new(1, 0, 0, 44)
-    topBar.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    topBar.Size                   = UDim2.new(1, 0, 0, 44)
+    topBar.BackgroundColor3       = Color3.fromRGB(22, 22, 30)
     topBar.BackgroundTransparency = 0.1
-    topBar.BorderSizePixel  = 0
-    topBar.Parent           = container
+    topBar.BorderSizePixel        = 0
+    topBar.Parent                 = container
 
     local topCorner = Instance.new("UICorner")
     topCorner.CornerRadius = UDim.new(0, 8)
@@ -714,26 +1103,26 @@ local function buildLoggerUI(container)
     topPad.Parent      = topBar
 
     statusLabel = Instance.new("TextLabel")
-    statusLabel.Size                  = UDim2.new(0.65, 0, 0, 18)
-    statusLabel.Position              = UDim2.new(0, 0, 0, 2)
+    statusLabel.Size                   = UDim2.new(0.65, 0, 0, 18)
+    statusLabel.Position               = UDim2.new(0, 0, 0, 2)
     statusLabel.BackgroundTransparency = 1
-    statusLabel.Text                  = "Waiting for scripts..."
-    statusLabel.TextColor3            = Color3.fromRGB(255, 215, 55)
-    statusLabel.TextSize              = 11
-    statusLabel.Font                  = Enum.Font.GothamBold
-    statusLabel.TextXAlignment        = Enum.TextXAlignment.Left
-    statusLabel.Parent                = topBar
+    statusLabel.Text                   = "Waiting for scripts..."
+    statusLabel.TextColor3             = Color3.fromRGB(255, 215, 55)
+    statusLabel.TextSize               = 11
+    statusLabel.Font                   = Enum.Font.GothamBold
+    statusLabel.TextXAlignment         = Enum.TextXAlignment.Left
+    statusLabel.Parent                 = topBar
 
     counterLabel = Instance.new("TextLabel")
-    counterLabel.Size                  = UDim2.new(0.35, -12, 0, 14)
-    counterLabel.Position              = UDim2.new(0.65, 0, 0, 6)
+    counterLabel.Size                   = UDim2.new(0.35, -12, 0, 14)
+    counterLabel.Position               = UDim2.new(0.65, 0, 0, 6)
     counterLabel.BackgroundTransparency = 1
-    counterLabel.Text                  = "Captured: 0"
-    counterLabel.TextColor3            = Color3.fromRGB(145, 255, 158)
-    counterLabel.TextSize              = 10
-    counterLabel.Font                  = Enum.Font.Code
-    counterLabel.TextXAlignment        = Enum.TextXAlignment.Right
-    counterLabel.Parent                = topBar
+    counterLabel.Text                   = "Captured: 0"
+    counterLabel.TextColor3             = Color3.fromRGB(145, 255, 158)
+    counterLabel.TextSize               = 10
+    counterLabel.Font                   = Enum.Font.Code
+    counterLabel.TextXAlignment         = Enum.TextXAlignment.Right
+    counterLabel.Parent                 = topBar
 
     local wrapper = Instance.new("Frame")
     wrapper.Size                   = UDim2.new(1, 0, 0, 345)
@@ -742,15 +1131,15 @@ local function buildLoggerUI(container)
     wrapper.Parent                 = container
 
     listScrollFrame = Instance.new("ScrollingFrame")
-    listScrollFrame.Size                   = UDim2.fromScale(1, 1)
-    listScrollFrame.BackgroundColor3       = Color3.fromRGB(18, 18, 24)
-    listScrollFrame.BackgroundTransparency = 0.1
-    listScrollFrame.BorderSizePixel        = 0
-    listScrollFrame.ScrollBarThickness     = 5
-    listScrollFrame.ScrollBarImageColor3   = Color3.fromRGB(0, 122, 204)
+    listScrollFrame.Size                       = UDim2.fromScale(1, 1)
+    listScrollFrame.BackgroundColor3           = Color3.fromRGB(18, 18, 24)
+    listScrollFrame.BackgroundTransparency     = 0.1
+    listScrollFrame.BorderSizePixel            = 0
+    listScrollFrame.ScrollBarThickness         = 5
+    listScrollFrame.ScrollBarImageColor3       = Color3.fromRGB(0, 122, 204)
     listScrollFrame.ScrollBarImageTransparency = 0.3
-    listScrollFrame.CanvasSize             = UDim2.fromScale(0, 0)
-    listScrollFrame.Parent                 = wrapper
+    listScrollFrame.CanvasSize                 = UDim2.fromScale(0, 0)
+    listScrollFrame.Parent                     = wrapper
 
     local sfCorner = Instance.new("UICorner")
     sfCorner.CornerRadius = UDim.new(0, 8)
@@ -769,58 +1158,31 @@ local function buildLoggerUI(container)
     pad.Parent        = listScrollFrame
 end
 
-local function installHook()
-    local ok = pcall(function()
-        loadstring = function(code, chunkname)
-            if type(code) == "string" and #code > 0 then
-                pcall(function()
-                    capturedCount = capturedCount + 1
+-- ═══════════════════════════════════════════════════════════════════
+--  FLUENT WINDOW
+-- ═══════════════════════════════════════════════════════════════════
 
-                    local rawName = tostring(chunkname or ""):gsub("[^%w%-%.]", "_")
-                    if rawName == "" or rawName == "_" then rawName = "script" end
-                    if #rawName > 38 then rawName = rawName:sub(1, 38) end
-                    local fileName = rawName .. "_" .. capturedCount .. ".lua"
+local Window = Fluent:CreateWindow({
+    Title       = "Alex JOK",
+    SubTitle    = "FRontEVill was here | v7.0",
+    TabWidth    = 160,
+    Size        = UDim2.fromOffset(660, 560),
+    Acrylic     = true,
+    Theme       = "Dark",
+    MinimizeKey = Enum.KeyCode.B,
+})
 
-                    local data = {
-                        index    = capturedCount,
-                        code     = code,
-                        fileName = fileName,
-                        time     = os.date("%H:%M:%S"),
-                    }
-
-                    table.insert(capturedScripts, data)
-                    ensureFolder()
-                    writeFile(FOLDER .. "/" .. fileName, code)
-
-                    task.spawn(function()
-                        if counterLabel then
-                            counterLabel.Text = "Captured: " .. capturedCount
-                        end
-                        if statusLabel then
-                            statusLabel.Text      = "Script Logger  -  Active"
-                            statusLabel.TextColor3 = Color3.fromRGB(86, 182, 86)
-                        end
-                        addEntry(data)
-                        notify("Alex JOK", "#" .. capturedCount .. "  " .. fileName)
-                    end)
-                end)
-            end
-            return originalLoadstring(code, chunkname)
-        end
-    end)
-
-    hookInstalled = ok
-
-    if not ok then
-        task.delay(2, function()
-            notify("Alex JOK", "loadstring hook blocked by executor. Manual mode only.")
-        end)
-    end
-end
+local Tabs = {
+    Logger   = Window:AddTab({ Title = "Script Logger", Icon = "code-2"   }),
+    Settings = Window:AddTab({ Title = "Settings",      Icon = "settings" }),
+}
 
 buildLoggerUI(Tabs.Logger.Container)
 
-task.defer(installHook)
+-- Install hooks after UI is ready (deferred so Fluent finishes first)
+task.defer(installHooks)
+
+-- ── Buttons ──────────────────────────────────────────────────────
 
 Tabs.Logger:AddButton({
     Title       = "Clear Log",
@@ -831,9 +1193,10 @@ Tabs.Logger:AddButton({
         end
         capturedScripts = {}
         capturedCount   = 0
+        seenHashes      = {}
         if counterLabel then counterLabel.Text = "Captured: 0" end
-        if statusLabel  then
-            statusLabel.Text      = "Waiting for scripts..."
+        if statusLabel then
+            statusLabel.Text       = "Waiting for scripts..."
             statusLabel.TextColor3 = Color3.fromRGB(255, 215, 55)
         end
         listScrollFrame.CanvasSize = UDim2.fromScale(0, 0)
@@ -856,6 +1219,17 @@ Tabs.Logger:AddButton({
     end,
 })
 
+Tabs.Logger:AddButton({
+    Title       = "Reinstall Hooks",
+    Description = "Re-apply all hooks (use after other scripts may have overwritten them)",
+    Callback    = function()
+        pcall(installHooks)
+        notify("Alex JOK", "Hooks reinstalled.")
+    end,
+})
+
+-- ── Save / Interface managers ────────────────────────────────────
+
 SaveManager:SetLibrary(Fluent)
 InterfaceManager:SetLibrary(Fluent)
 SaveManager:IgnoreThemeSettings()
@@ -869,7 +1243,7 @@ Window:SelectTab(1)
 
 Fluent:Notify({
     Title    = "Alex JOK",
-    Content  = "FRontEVill v6.0 loaded.  Press B to toggle.",
+    Content  = "FRontEVill v7.0 loaded.  Press B to toggle.",
     Duration = 6,
 })
 
