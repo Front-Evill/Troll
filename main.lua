@@ -1,7 +1,3 @@
--- FRONT GUI Library
--- github.com/YOUR_USERNAME/FRONT_GUI
--- loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR_USERNAME/FRONT_GUI/main/main.lua"))()
-
 local Players          = game:GetService("Players")
 local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -9,10 +5,6 @@ local RunService       = game:GetService("RunService")
 
 local Player    = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
-
--- ──────────────────────────────────────────────────────────────────
--- THEMES
--- ──────────────────────────────────────────────────────────────────
 
 local Themes = {
     Dark = {
@@ -119,10 +111,6 @@ local Themes = {
     },
 }
 
--- ──────────────────────────────────────────────────────────────────
--- ICONS
--- ──────────────────────────────────────────────────────────────────
-
 local Icons = {
     home         = "rbxassetid://92309619719802",
     settings     = "rbxassetid://10734950309",
@@ -155,10 +143,6 @@ local Icons = {
     trending     = "rbxassetid://73414152507992",
     undo         = "rbxassetid://116283716426162",
 }
-
--- ──────────────────────────────────────────────────────────────────
--- UTILITIES
--- ──────────────────────────────────────────────────────────────────
 
 local function Tw(obj, dur, style, dir, props)
     return TweenService:Create(
@@ -304,12 +288,10 @@ function Library:CreateWindow(cfg)
     Screen.Name = "FRONT_GUI"; Screen.ResetOnSpawn = false
     Screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; Screen.Parent = PlayerGui
 
-    -- Notification holder
     local NotifFrame = NewFrame(Screen, Color3.new(), 1, UDim2.new(0,310,1,-24), UDim2.new(1,-318,1,-12))
     NotifFrame.AnchorPoint = Vector2.new(0,1); NotifFrame.ZIndex = 900
     NewVList(NotifFrame, 6, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Bottom)
 
-    -- ── Welcome Screen ──────────────────────────────────────────
     local Dimmer = NewFrame(Screen, Color3.new(), 0.38, UDim2.fromScale(1,1))
     Dimmer.ZIndex = 200
 
@@ -372,7 +354,6 @@ function Library:CreateWindow(cfg)
         if i ~= loadIdx then loadIdx = i; WStatusL.Text = loadMsgs[i] end
     end)
 
-    -- ── Main Window ──────────────────────────────────────────────
     local Main = NewFrame(Screen, TH.Background, 0, Size, UDim2.fromScale(0.5,0.5))
     Main.AnchorPoint = Vector2.new(0.5,0.5); Main.Visible = false; Main.ZIndex = 10
     NewCorner(Main, 12); NewStroke(Main, TH.Border, 0.20, 1)
@@ -492,7 +473,6 @@ function Library:CreateWindow(cfg)
         UptimeLabel.Text = FormatTime(tick() - T0)
     end)
 
-    -- Welcome → Main transition
     task.spawn(function()
         task.wait(LoadTime)
         loadConn:Disconnect()
@@ -520,7 +500,6 @@ function Library:CreateWindow(cfg)
         TwSpring(Main, 0.55, {Size = Size}):Play()
     end)
 
-    -- ── Notify ──────────────────────────────────────────────────
     local notifN = 0
 
     function Window:Notify(cfg2)
