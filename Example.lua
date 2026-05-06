@@ -1,4 +1,4 @@
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR_USERNAME/FRONT_GUI/main/main.lua"))()
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/Front-Evill/Troll/refs/heads/main/main.luau"))()
 
 local Window = Library:CreateWindow({
     Title       = "My Script",
